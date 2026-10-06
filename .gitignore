@@ -1,0 +1,25 @@
+# Python / PyTorch / Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pt
+*.pth
+*.bin
+
+# Environments
+venv/
+env/
+ENV/
+.env
+
+# Large dataset raw/processed binaries (keep small sample/csv if desired)
+data/processed/
+checkpoints/
+logs/
+.ipynb_checkpoints/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
