@@ -118,7 +118,19 @@ ABSA/
 python src/preprocess.py
 ```
 
-### Step 2: Run ASTE Multi-Task Training
-```bash
-python src/train.py
-```
+## 6. Experimental Results
+
+### Phase 1: Frozen BERT Baseline (`FREEZE_ENCODER = True`)
+- **Backbone:** `bert-base-uncased` (Frozen, zero gradient updates)
+- **Trainable Parameters:** Only ASTE-specific linear heads
+- **Hardware:** Local Intel CPU (Optimized with float16 cached token embeddings)
+- **Epochs:** 5 | **Batch Size:** 8 | **Learning Rate:** 1e-3
+
+| Metric | Dev Set | Test Set |
+|---|---|---|
+| **Strict Triplet Precision** | 37.39% | **37.65%** |
+| **Strict Triplet Recall** | 38.30% | **40.34%** |
+| **Strict Triplet F1-Score** | **37.84%** | **38.95%** |
+| **Correct Triplets Extracted** | 221 / 577 | **401 / 994** |
+
+> Note: All metrics use strict exact triplet matching on predicted spans (no gold span leakage). Phase 2 will unfreeze BERT for end-to-end fine-tuning to compare performance improvements.
