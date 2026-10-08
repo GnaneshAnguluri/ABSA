@@ -1,16 +1,20 @@
 """
-evaluate.py - Step 10: Strict ASTE Triplet Evaluation (Precision, Recall, F1).
+evaluate.py - End-to-End Strict ASTE Triplet Evaluation.
 
-A predicted triplet (Aspect, Opinion, Sentiment) is counted as CORRECT if and only if:
-1. Aspect word span matches gold exactly
-2. Opinion word span matches gold exactly
-3. Sentiment polarity matches gold exactly
+Evaluation Pipeline:
+1. Sentence tokens -> BERT -> Aspect BIO logits & Opinion BIO logits
+2. argmax BIO predictions -> extract predicted aspect token spans & opinion token spans
+3. Map predicted subword token spans back to word spans using word_ids
+4. Cartesian product of predicted aspects x predicted opinions
+5. Pool candidate pair representations from BERT contextual embeddings
+6. Relation classifier -> keep only pairs predicted VALID (label 1)
+7. Sentiment classifier -> assign POS / NEG / NEU
+8. Compare predicted (Aspect, Opinion, Sentiment) triplets against gold triplets with strict exact matching.
 """
 
 import os
 import sys
 import torch
-from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
@@ -18,8 +22,8 @@ import config
 
 def extract_spans_from_bio(bio_ids: list, tag_type: str = "ASP"):
     """
-    Extract token/word spans from a sequence of BIO tag IDs.
-    Returns: list of (start_idx, end_idx) inclusive.
+    Extract token spans [start_idx, end_idx] (inclusive) from a sequence of BIO tag IDs.
+    Handles B-TAG followed by consecutive I-TAGs.
     """
     spans = []
     current_span = None
@@ -46,10 +50,32 @@ def extract_spans_from_bio(bio_ids: list, tag_type: str = "ASP"):
     return spans
 
 
+def token_span_to_word_span(token_span: list, word_ids: list):
+    """
+    Maps a BERT subword token span [tok_start, tok_end] (inclusive)
+    back to the original word-level span [w_start, w_end] (inclusive).
+
+    Returns:
+        [w_start, w_end] or None if the token span contains only special/padding tokens.
+    """
+    tok_start, tok_end = token_span
+    mapped_word_indices = []
+
+    for t_idx in range(tok_start, tok_end + 1):
+        if t_idx < len(word_ids):
+            w_id = word_ids[t_idx]
+            if w_id is not None:
+                mapped_word_indices.append(w_id)
+
+    if len(mapped_word_indices) == 0:
+        return None
+
+    return [min(mapped_word_indices), max(mapped_word_indices)]
+
+
 def compute_aste_metrics(gold_triplets_all: list, pred_triplets_all: list):
     """
     Compute strict Triplet Precision, Recall, and F1.
-
     Each triplet is represented as: ( (a_start, a_end), (o_start, o_end), sentiment )
     """
     n_gold = sum(len(g) for g in gold_triplets_all)
@@ -77,8 +103,8 @@ def compute_aste_metrics(gold_triplets_all: list, pred_triplets_all: list):
 
 def evaluate_model(model, data_loader, device):
     """
-    Run evaluation over a DataLoader.
-    Computes loss and strict ASTE triplet extraction metrics.
+    Run end-to-end evaluation over a DataLoader.
+    Extracts triplets strictly from predicted BIO spans and model classification heads.
     """
     model.eval()
     total_loss = 0.0
@@ -100,6 +126,7 @@ def evaluate_model(model, data_loader, device):
             r_labels  = batch["relation_labels"].to(device)
             s_labels  = batch["sentiment_labels"].to(device)
 
+            # 1. Forward pass for loss calculation (on gold pairs for consistent loss reporting)
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -116,33 +143,87 @@ def evaluate_model(model, data_loader, device):
                 total_loss += outputs["loss"].item()
             num_batches += 1
 
-            # Format gold triplets for each sentence in batch
-            batch_gold = batch["gold_triples"]
-            for g_list in batch_gold:
+            # Format gold triplets
+            for g_list in batch["gold_triples"]:
                 formatted_gold = [
                     (tuple(t["aspect_span"]), tuple(t["opinion_span"]), t["sentiment"])
                     for t in g_list
                 ]
                 gold_all.append(formatted_gold)
 
-            # Extract predicted triplets from relation & sentiment logits
+            # 2. End-to-End Extraction from Model's Predicted BIO Logits
+            sequence_output = outputs["sequence_output"]  # [B, SeqLen, 768]
+            asp_preds = outputs["aspect_logits"].argmax(dim=-1).cpu().tolist()   # [B, SeqLen]
+            opn_preds = outputs["opinion_logits"].argmax(dim=-1).cpu().tolist()  # [B, SeqLen]
+
             batch_size = input_ids.shape[0]
+
+            # Build candidate pairs from predicted spans per sentence
+            eval_batch_indices = []
+            eval_asp_tok_spans = []
+            eval_opn_tok_spans = []
+            eval_pair_metadata = []
+
+            for b_idx in range(batch_size):
+                word_ids = batch["word_ids"][b_idx]
+
+                # Extract predicted token spans from BIO output
+                pred_asp_tok_spans = extract_spans_from_bio(asp_preds[b_idx], tag_type="ASP")
+                pred_opn_tok_spans = extract_spans_from_bio(opn_preds[b_idx], tag_type="OPN")
+
+                # Map token spans to word spans
+                valid_asp_pairs = []
+                for a_tok in pred_asp_tok_spans:
+                    a_word = token_span_to_word_span(a_tok, word_ids)
+                    if a_word is not None:
+                        valid_asp_pairs.append((a_tok, a_word))
+
+                valid_opn_pairs = []
+                for o_tok in pred_opn_tok_spans:
+                    o_word = token_span_to_word_span(o_tok, word_ids)
+                    if o_word is not None:
+                        valid_opn_pairs.append((o_tok, o_word))
+
+                # Cartesian product of predicted aspects x predicted opinions
+                for (a_tok, a_word) in valid_asp_pairs:
+                    for (o_tok, o_word) in valid_opn_pairs:
+                        eval_batch_indices.append(b_idx)
+                        eval_asp_tok_spans.append(a_tok)
+                        eval_opn_tok_spans.append(o_tok)
+                        eval_pair_metadata.append({
+                            "batch_idx"       : b_idx,
+                            "aspect_word_span": a_word,
+                            "opinion_word_span": o_word
+                        })
+
+            # Run relation and sentiment classification on predicted pairs
             batch_preds = [[] for _ in range(batch_size)]
 
-            if outputs["relation_logits"] is not None and len(outputs["relation_logits"]) > 0:
-                rel_preds  = outputs["relation_logits"].argmax(dim=-1).cpu().tolist()
-                sent_preds = outputs["sentiment_logits"].argmax(dim=-1).cpu().tolist()
+            if len(eval_batch_indices) > 0:
+                e_batch_indices = torch.tensor(eval_batch_indices, dtype=torch.long, device=device)
+                e_asp_spans     = torch.tensor(eval_asp_tok_spans, dtype=torch.long, device=device)
+                e_opn_spans     = torch.tensor(eval_opn_tok_spans, dtype=torch.long, device=device)
 
-                for p_idx, meta in enumerate(batch["pair_metadata"]):
-                    is_valid = rel_preds[p_idx] == 1
-                    if is_valid:
-                        pred_sentiment = config.ID2SENTIMENT[sent_preds[p_idx]]
-                        pred_triplet = (
+                rel_logits, sent_logits = model.classify_pairs(
+                    sequence_output=sequence_output,
+                    pair_batch_indices=e_batch_indices,
+                    aspect_tok_spans=e_asp_spans,
+                    opinion_tok_spans=e_opn_spans
+                )
+
+                pred_rels  = rel_logits.argmax(dim=-1).cpu().tolist()
+                pred_sents = sent_logits.argmax(dim=-1).cpu().tolist()
+
+                for p_idx, meta in enumerate(eval_pair_metadata):
+                    # Keep only pairs classified as VALID (label 1)
+                    if pred_rels[p_idx] == 1:
+                        sentiment_str = config.ID2SENTIMENT[pred_sents[p_idx]]
+                        predicted_triplet = (
                             tuple(meta["aspect_word_span"]),
                             tuple(meta["opinion_word_span"]),
-                            pred_sentiment
+                            sentiment_str
                         )
-                        batch_preds[meta["batch_idx"]].append(pred_triplet)
+                        batch_preds[meta["batch_idx"]].append(predicted_triplet)
 
             pred_all.extend(batch_preds)
 

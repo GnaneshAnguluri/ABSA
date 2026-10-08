@@ -80,6 +80,7 @@ def aste_collate_fn(batch):
     gold_triples = [f["gold_triples"] for f in batch]
     raw_sentences = [f["sentence"] for f in batch]
     raw_words     = [f["words"] for f in batch]
+    raw_word_ids  = [f["word_ids"] for f in batch]
 
     return {
         "input_ids"         : input_ids,           # [B, max_len]
@@ -94,6 +95,7 @@ def aste_collate_fn(batch):
         "gold_triples"      : gold_triples,        # list of length B
         "sentences"         : raw_sentences,
         "words"             : raw_words,
+        "word_ids"          : raw_word_ids,
         "pair_metadata"     : pair_metadata
     }
 

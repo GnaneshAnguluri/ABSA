@@ -166,8 +166,35 @@ class ASTEModel(nn.Module):
         return {
             "loss"            : total_loss,
             "loss_dict"       : loss_dict,
+            "sequence_output" : sequence_output,
             "aspect_logits"   : aspect_logits,
             "opinion_logits"  : opinion_logits,
             "relation_logits" : relation_logits,
             "sentiment_logits": sentiment_logits
         }
+
+    def classify_pairs(self, sequence_output: torch.Tensor, pair_batch_indices: torch.Tensor,
+                       aspect_tok_spans: torch.Tensor, opinion_tok_spans: torch.Tensor):
+        """
+        Takes arbitrary candidate pairs and predicts relation and sentiment logits.
+        Used during evaluation on model-predicted spans.
+        """
+        if len(pair_batch_indices) == 0:
+            return None, None
+
+        pair_vectors = []
+        for idx in range(len(pair_batch_indices)):
+            b_idx = pair_batch_indices[idx].item()
+            asp_s, asp_e = aspect_tok_spans[idx][0].item(), aspect_tok_spans[idx][1].item()
+            opn_s, opn_e = opinion_tok_spans[idx][0].item(), opinion_tok_spans[idx][1].item()
+
+            sent_tokens = sequence_output[b_idx]
+            h_asp = self.pool_span(sent_tokens, asp_s, asp_e)
+            h_opn = self.pool_span(sent_tokens, opn_s, opn_e)
+            h_pair = torch.cat([h_asp, h_opn], dim=-1)
+            pair_vectors.append(h_pair)
+
+        pair_reps = torch.stack(pair_vectors, dim=0)
+        rel_logits = self.relation_classifier(pair_reps)
+        sent_logits = self.sentiment_classifier(pair_reps)
+        return rel_logits, sent_logits

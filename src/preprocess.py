@@ -163,6 +163,7 @@ def encode_sentence_sample(sample: dict, tokenizer, max_len: int = config.MAX_SE
         "candidate_pairs": candidate_pairs,
         "sentence"       : sample["sentence"],
         "words"          : words,
+        "word_ids"       : word_ids,
         "gold_triples"   : triples
     }
 
