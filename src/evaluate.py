@@ -117,6 +117,7 @@ def evaluate_model(model, data_loader, device):
         for batch in data_loader:
             input_ids       = batch["input_ids"].to(device)
             attention_mask  = batch["attention_mask"].to(device)
+            embeddings      = batch["embeddings"].to(device) if batch["embeddings"] is not None else None
             aspect_labels   = batch["aspect_labels"].to(device)
             opinion_labels  = batch["opinion_labels"].to(device)
 
@@ -130,6 +131,7 @@ def evaluate_model(model, data_loader, device):
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                embeddings=embeddings,
                 aspect_labels=aspect_labels,
                 opinion_labels=opinion_labels,
                 pair_batch_indices=p_indices,

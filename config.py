@@ -9,11 +9,12 @@ DATA_DIR       = "data/raw"
 PROCESSED_DIR  = "data/processed"
 
 # --- Model & Encoder ---
-ENCODER_MODEL   = "bert-base-uncased"
-MAX_SEQ_LEN     = 128
-HIDDEN_SIZE     = 768               # BERT base hidden size
-PAIR_HIDDEN_SIZE= 1536              # 768 * 2 (concatenated aspect + opinion vectors)
-FREEZE_ENCODER  = True              # Phase 1: Freeze BERT parameters
+ENCODER_MODEL         = "bert-base-uncased"
+MAX_SEQ_LEN           = 128
+HIDDEN_SIZE           = 768               # BERT base hidden size
+PAIR_HIDDEN_SIZE      = 1536              # 768 * 2 (concatenated aspect + opinion vectors)
+FREEZE_ENCODER        = True              # Phase 1: Freeze BERT parameters
+USE_CACHED_EMBEDDINGS = True              # CPU Optimization: Cache frozen BERT embeddings
 
 # --- Label Counts & Tag Mappings ---
 NUM_ASPECT_LABELS   = 3             # O: 0, B-ASP: 1, I-ASP: 2
@@ -28,10 +29,10 @@ SENTIMENT_MAP = {"NEG": 0, "NEU": 1, "POS": 2}
 ID2SENTIMENT  = {0: "NEG", 1: "NEU", 2: "POS"}
 
 # --- Training Hyperparameters ---
-BATCH_SIZE     = 16
-LEARNING_RATE  = 1e-3               # Higher LR for ASTE linear heads when BERT is frozen
+BATCH_SIZE     = 8                  # Set to 8 for CPU optimization
+LEARNING_RATE  = 1e-3               # LR for ASTE linear heads in Phase 1
 WEIGHT_DECAY   = 0.01
-EPOCHS         = 20
+EPOCHS         = 5                  # Phase 1: 5 epochs
 WARMUP_STEPS   = 50
 MAX_GRAD_NORM  = 1.0
 

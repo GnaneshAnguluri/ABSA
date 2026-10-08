@@ -74,8 +74,9 @@ class ASTEModel(nn.Module):
         return span_reps.mean(dim=0)
 
     def forward(self,
-                input_ids: torch.Tensor,
-                attention_mask: torch.Tensor,
+                input_ids: torch.Tensor = None,
+                attention_mask: torch.Tensor = None,
+                embeddings: torch.Tensor = None,
                 aspect_labels: torch.Tensor = None,
                 opinion_labels: torch.Tensor = None,
                 pair_batch_indices: torch.Tensor = None,
@@ -85,10 +86,16 @@ class ASTEModel(nn.Module):
                 sentiment_labels: torch.Tensor = None):
         """
         Forward pass for ASTE multi-task pipeline.
+        Supports precomputed cached embeddings to bypass BERT on CPU.
         """
         # Step 1: Transformer Contextual Token Embeddings
-        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        sequence_output = outputs.last_hidden_state   # [Batch, SeqLen, 768]
+        if embeddings is not None:
+            # Cast float16 -> float32 for downstream linear layers
+            sequence_output = embeddings.to(torch.float32)
+        else:
+            outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+            sequence_output = outputs.last_hidden_state   # [Batch, SeqLen, 768]
+
         sequence_output = self.dropout(sequence_output)
 
         # Step 2: Parallel BIO Logits

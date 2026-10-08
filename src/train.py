@@ -21,6 +21,10 @@ def train():
     device = get_device()
     os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
 
+    if config.USE_CACHED_EMBEDDINGS:
+        from src.cache_embeddings import build_all_embedding_caches
+        build_all_embedding_caches()
+
     print("\n[train] Loading ASTE DataLoaders...")
     train_loader, dev_loader, test_loader = get_dataloaders()
 
@@ -54,6 +58,7 @@ def train():
 
             input_ids       = batch["input_ids"].to(device)
             attention_mask  = batch["attention_mask"].to(device)
+            embeddings      = batch["embeddings"].to(device) if batch["embeddings"] is not None else None
             aspect_labels   = batch["aspect_labels"].to(device)
             opinion_labels  = batch["opinion_labels"].to(device)
 
@@ -66,6 +71,7 @@ def train():
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                embeddings=embeddings,
                 aspect_labels=aspect_labels,
                 opinion_labels=opinion_labels,
                 pair_batch_indices=p_indices,

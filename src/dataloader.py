@@ -36,12 +36,17 @@ class ASTESentenceDataset(Dataset):
 
 def aste_collate_fn(batch):
     """
-    Collate function that dynamically aggregates variable numbers of candidate pairs per batch.
+    Collate function that dynamically aggregates variable numbers of candidate pairs per batch,
+    and includes precomputed BERT embeddings if present.
     """
     input_ids      = torch.stack([f["input_ids"] for f in batch])
     attention_mask = torch.stack([f["attention_mask"] for f in batch])
     aspect_labels  = torch.stack([f["aspect_labels"] for f in batch])
     opinion_labels = torch.stack([f["opinion_labels"] for f in batch])
+
+    embeddings = None
+    if "embedding" in batch[0]:
+        embeddings = torch.stack([f["embedding"] for f in batch])  # [B, 128, 768] float16
 
     pair_batch_indices = []
     aspect_tok_spans   = []
@@ -85,6 +90,7 @@ def aste_collate_fn(batch):
     return {
         "input_ids"         : input_ids,           # [B, max_len]
         "attention_mask"    : attention_mask,      # [B, max_len]
+        "embeddings"        : embeddings,          # [B, max_len, 768] (float16) or None
         "aspect_labels"     : aspect_labels,       # [B, max_len]
         "opinion_labels"    : opinion_labels,      # [B, max_len]
         "pair_batch_indices": pair_batch_indices,  # [num_pairs]
@@ -102,13 +108,26 @@ def aste_collate_fn(batch):
 
 def get_dataloaders(dataset_split: str = config.DATASET_SPLIT,
                     batch_size:    int  = config.BATCH_SIZE,
+                    use_cached:    bool = config.USE_CACHED_EMBEDDINGS,
                     num_workers:   int  = 0):
     """Returns train, dev, and test DataLoader objects."""
     base = config.PROCESSED_DIR
+    suffix = "_cached.pt" if use_cached else "_aste.pt"
 
-    train_feats = load_features(os.path.join(base, f"{dataset_split}_train_aste.pt"))
-    dev_feats   = load_features(os.path.join(base, f"{dataset_split}_dev_aste.pt"))
-    test_feats  = load_features(os.path.join(base, f"{dataset_split}_test_aste.pt"))
+    train_path = os.path.join(base, f"{dataset_split}_train{suffix}")
+    dev_path   = os.path.join(base, f"{dataset_split}_dev{suffix}")
+    test_path  = os.path.join(base, f"{dataset_split}_test{suffix}")
+
+    # Fallback to non-cached if cached files don't exist yet
+    if use_cached and not os.path.exists(train_path):
+        print("[dataloader] Cached files not found, falling back to non-cached features.")
+        train_path = os.path.join(base, f"{dataset_split}_train_aste.pt")
+        dev_path   = os.path.join(base, f"{dataset_split}_dev_aste.pt")
+        test_path  = os.path.join(base, f"{dataset_split}_test_aste.pt")
+
+    train_feats = load_features(train_path)
+    dev_feats   = load_features(dev_path)
+    test_feats  = load_features(test_path)
 
     train_ds = ASTESentenceDataset(train_feats)
     dev_ds   = ASTESentenceDataset(dev_feats)
@@ -127,7 +146,7 @@ def get_dataloaders(dataset_split: str = config.DATASET_SPLIT,
         num_workers=num_workers, collate_fn=aste_collate_fn
     )
 
-    print(f"\n[dataloader] Split: {dataset_split} | Batch size: {batch_size}")
+    print(f"\n[dataloader] Split: {dataset_split} | Batch size: {batch_size} | Cached: {use_cached}")
     print(f"[dataloader] Train sentences: {len(train_ds)} ({len(train_loader)} batches)")
     print(f"[dataloader] Dev sentences:   {len(dev_ds)} ({len(dev_loader)} batches)")
     print(f"[dataloader] Test sentences:  {len(test_ds)} ({len(test_loader)} batches)")
