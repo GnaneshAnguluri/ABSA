@@ -102,26 +102,12 @@ class ASTEModel(nn.Module):
         loss_dict = {}
 
         if pair_batch_indices is not None and len(pair_batch_indices) > 0:
-            pair_vectors = []
-            for idx in range(len(pair_batch_indices)):
-                b_idx = pair_batch_indices[idx].item()
-                asp_s, asp_e = aspect_tok_spans[idx][0].item(), aspect_tok_spans[idx][1].item()
-                opn_s, opn_e = opinion_tok_spans[idx][0].item(), opinion_tok_spans[idx][1].item()
-
-                sent_tokens = sequence_output[b_idx]  # [SeqLen, 768]
-
-                h_asp = self.pool_span(sent_tokens, asp_s, asp_e)  # [768]
-                h_opn = self.pool_span(sent_tokens, opn_s, opn_e)  # [768]
-
-                # 1536-dim concatenated pair representation: [h_asp ; h_opn]
-                h_pair = torch.cat([h_asp, h_opn], dim=-1)         # [1536]
-                pair_vectors.append(h_pair)
-
-            pair_reps = torch.stack(pair_vectors, dim=0)           # [num_pairs, 1536]
-
-            # Step 4: Relation & Sentiment predictions for candidate pairs
-            relation_logits = self.relation_classifier(pair_reps)   # [num_pairs, 2]
-            sentiment_logits = self.sentiment_classifier(pair_reps) # [num_pairs, 3]
+            relation_logits, sentiment_logits = self.classify_pairs(
+                sequence_output=sequence_output,
+                pair_batch_indices=pair_batch_indices,
+                aspect_tok_spans=aspect_tok_spans,
+                opinion_tok_spans=opinion_tok_spans
+            )
 
         # Step 5: Multi-Task Loss Calculation (if targets are supplied)
         if aspect_labels is not None and opinion_labels is not None:
