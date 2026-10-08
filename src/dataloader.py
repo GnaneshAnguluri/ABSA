@@ -1,8 +1,14 @@
 """
-dataloader.py - Step 4: PyTorch Dataset & DataLoader for the ABSA pipeline.
+dataloader.py - Step 4: ASTE Sentence-Level Dataset & Collate Function.
 
-Wraps the pre-processed feature dicts into a torch Dataset
-and returns batched DataLoaders for train / dev / test.
+Handles:
+- Standard sequence inputs: input_ids, attention_mask, aspect_labels, opinion_labels [B, max_len]
+- Variable-length candidate pairs via custom collate_fn:
+  - pair_batch_indices: [num_pairs] tensor indicating which sentence in the batch this pair belongs to
+  - aspect_tok_spans:   [num_pairs, 2] tensor (start_tok, end_tok)
+  - opinion_tok_spans:  [num_pairs, 2] tensor (start_tok, end_tok)
+  - relation_labels:    [num_pairs] tensor (0=INVALID, 1=VALID)
+  - sentiment_labels:   [num_pairs] tensor (0=NEG, 1=NEU, 2=POS, -100=IGNORE)
 """
 
 import os
@@ -15,21 +21,8 @@ import config
 from src.preprocess import load_features
 
 
-# ─────────────────────────────────────────────────────────────
-#  PyTorch Dataset
-# ─────────────────────────────────────────────────────────────
-
-class ABSADataset(Dataset):
-    """
-    Wraps a list of pre-processed feature dicts into a PyTorch Dataset.
-
-    Each __getitem__ returns a dict of tensors:
-        input_ids       : [max_len]   - BERT token IDs
-        attention_mask  : [max_len]   - 1=real token, 0=pad
-        aspect_labels   : [max_len]   - BIO tag IDs  (IGNORE_INDEX for CLS/SEP/PAD/subwords)
-        opinion_labels  : [max_len]   - BIO tag IDs
-        sentiment_label : []          - scalar int  (NEG=0, NEU=1, POS=2)
-    """
+class ASTESentenceDataset(Dataset):
+    """Wraps preprocessed sentence-level ASTE feature dictionaries."""
 
     def __init__(self, features: list):
         self.features = features
@@ -38,127 +31,103 @@ class ABSADataset(Dataset):
         return len(self.features)
 
     def __getitem__(self, idx):
-        feat = self.features[idx]
-        return {
-            "input_ids"      : feat["input_ids"],                              # [128]
-            "attention_mask" : feat["attention_mask"],                         # [128]
-            "aspect_labels"  : feat["aspect_labels"],                          # [128]
-            "opinion_labels" : feat["opinion_labels"],                         # [128]
-            "sentiment_label": torch.tensor(feat["sentiment_label"],
-                                            dtype=torch.long),                 # scalar
-        }
+        return self.features[idx]
 
 
-# ─────────────────────────────────────────────────────────────
-#  DataLoader Factory
-# ─────────────────────────────────────────────────────────────
+def aste_collate_fn(batch):
+    """
+    Collate function that dynamically aggregates variable numbers of candidate pairs per batch.
+    """
+    input_ids      = torch.stack([f["input_ids"] for f in batch])
+    attention_mask = torch.stack([f["attention_mask"] for f in batch])
+    aspect_labels  = torch.stack([f["aspect_labels"] for f in batch])
+    opinion_labels = torch.stack([f["opinion_labels"] for f in batch])
+
+    pair_batch_indices = []
+    aspect_tok_spans   = []
+    opinion_tok_spans  = []
+    relation_labels    = []
+    sentiment_labels   = []
+    pair_metadata      = []
+
+    for b_idx, f in enumerate(batch):
+        for cp in f["candidate_pairs"]:
+            pair_batch_indices.append(b_idx)
+            aspect_tok_spans.append(cp["aspect_tok_span"])
+            opinion_tok_spans.append(cp["opinion_tok_span"])
+            relation_labels.append(cp["relation_label"])
+            sentiment_labels.append(cp["sentiment_label"])
+            pair_metadata.append({
+                "batch_idx"        : b_idx,
+                "sentence"         : f["sentence"],
+                "aspect_word_span" : cp["aspect_word_span"],
+                "opinion_word_span": cp["opinion_word_span"],
+            })
+
+    if len(pair_batch_indices) > 0:
+        pair_batch_indices = torch.tensor(pair_batch_indices, dtype=torch.long)
+        aspect_tok_spans   = torch.tensor(aspect_tok_spans, dtype=torch.long)
+        opinion_tok_spans  = torch.tensor(opinion_tok_spans, dtype=torch.long)
+        relation_labels    = torch.tensor(relation_labels, dtype=torch.long)
+        sentiment_labels   = torch.tensor(sentiment_labels, dtype=torch.long)
+    else:
+        pair_batch_indices = torch.empty(0, dtype=torch.long)
+        aspect_tok_spans   = torch.empty((0, 2), dtype=torch.long)
+        opinion_tok_spans  = torch.empty((0, 2), dtype=torch.long)
+        relation_labels    = torch.empty(0, dtype=torch.long)
+        sentiment_labels   = torch.empty(0, dtype=torch.long)
+
+    gold_triples = [f["gold_triples"] for f in batch]
+    raw_sentences = [f["sentence"] for f in batch]
+    raw_words     = [f["words"] for f in batch]
+
+    return {
+        "input_ids"         : input_ids,           # [B, max_len]
+        "attention_mask"    : attention_mask,      # [B, max_len]
+        "aspect_labels"     : aspect_labels,       # [B, max_len]
+        "opinion_labels"    : opinion_labels,      # [B, max_len]
+        "pair_batch_indices": pair_batch_indices,  # [num_pairs]
+        "aspect_tok_spans"  : aspect_tok_spans,    # [num_pairs, 2]
+        "opinion_tok_spans" : opinion_tok_spans,   # [num_pairs, 2]
+        "relation_labels"   : relation_labels,     # [num_pairs]
+        "sentiment_labels"  : sentiment_labels,    # [num_pairs]
+        "gold_triples"      : gold_triples,        # list of length B
+        "sentences"         : raw_sentences,
+        "words"             : raw_words,
+        "pair_metadata"     : pair_metadata
+    }
+
 
 def get_dataloaders(dataset_split: str = config.DATASET_SPLIT,
                     batch_size:    int  = config.BATCH_SIZE,
                     num_workers:   int  = 0):
-    """
-    Load pre-processed .pt files and return three DataLoaders.
-
-    Args:
-        dataset_split : one of '14res', '14lap', '15res', '16res'
-        batch_size    : number of samples per batch
-        num_workers   : parallel data loading workers
-                        (keep 0 on Windows to avoid multiprocessing issues)
-
-    Returns:
-        train_loader, dev_loader, test_loader
-    """
+    """Returns train, dev, and test DataLoader objects."""
     base = config.PROCESSED_DIR
 
-    # ── Load pre-processed features ──
-    train_feats = load_features(os.path.join(base, f"{dataset_split}_train.pt"))
-    dev_feats   = load_features(os.path.join(base, f"{dataset_split}_dev.pt"))
-    test_feats  = load_features(os.path.join(base, f"{dataset_split}_test.pt"))
+    train_feats = load_features(os.path.join(base, f"{dataset_split}_train_aste.pt"))
+    dev_feats   = load_features(os.path.join(base, f"{dataset_split}_dev_aste.pt"))
+    test_feats  = load_features(os.path.join(base, f"{dataset_split}_test_aste.pt"))
 
-    # ── Wrap in Dataset ──
-    train_ds = ABSADataset(train_feats)
-    dev_ds   = ABSADataset(dev_feats)
-    test_ds  = ABSADataset(test_feats)
+    train_ds = ASTESentenceDataset(train_feats)
+    dev_ds   = ASTESentenceDataset(dev_feats)
+    test_ds  = ASTESentenceDataset(test_feats)
 
-    # ── Build DataLoaders ──
     train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,           # shuffle only training data
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available()
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, collate_fn=aste_collate_fn
     )
     dev_loader = DataLoader(
-        dev_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available()
+        dev_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, collate_fn=aste_collate_fn
     )
     test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available()
+        test_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, collate_fn=aste_collate_fn
     )
 
-    print(f"\n[dataloader] Split         : {dataset_split}")
-    print(f"[dataloader] Batch size    : {batch_size}")
-    print(f"[dataloader] Train batches : {len(train_loader)}  ({len(train_ds)} samples)")
-    print(f"[dataloader] Dev batches   : {len(dev_loader)}  ({len(dev_ds)} samples)")
-    print(f"[dataloader] Test batches  : {len(test_loader)}  ({len(test_ds)} samples)")
+    print(f"\n[dataloader] Split: {dataset_split} | Batch size: {batch_size}")
+    print(f"[dataloader] Train sentences: {len(train_ds)} ({len(train_loader)} batches)")
+    print(f"[dataloader] Dev sentences:   {len(dev_ds)} ({len(dev_loader)} batches)")
+    print(f"[dataloader] Test sentences:  {len(test_ds)} ({len(test_loader)} batches)")
 
     return train_loader, dev_loader, test_loader
-
-
-# ─────────────────────────────────────────────────────────────
-#  DEBUG — Inspect one batch
-# ─────────────────────────────────────────────────────────────
-
-def inspect_batch(batch: dict):
-    """Print shapes and a sample of values from one batch."""
-    print(f"\n[dataloader] Batch contents:")
-    print(f"  input_ids       : {batch['input_ids'].shape}     dtype={batch['input_ids'].dtype}")
-    print(f"  attention_mask  : {batch['attention_mask'].shape}     dtype={batch['attention_mask'].dtype}")
-    print(f"  aspect_labels   : {batch['aspect_labels'].shape}     dtype={batch['aspect_labels'].dtype}")
-    print(f"  opinion_labels  : {batch['opinion_labels'].shape}     dtype={batch['opinion_labels'].dtype}")
-    print(f"  sentiment_label : {batch['sentiment_label'].shape}     dtype={batch['sentiment_label'].dtype}")
-
-    print(f"\n  First sample sentiment labels : {batch['sentiment_label'][:8].tolist()}")
-    print(f"  First sample aspect tags      : {batch['aspect_labels'][0][:20].tolist()}  ...")
-    print(f"  First sample opinion tags     : {batch['opinion_labels'][0][:20].tolist()}  ...")
-
-    # Count non-ignored tokens in first sample
-    mask      = batch['aspect_labels'][0] != -100
-    real_toks = mask.sum().item()
-    asp_toks  = (batch['aspect_labels'][0] > 0).sum().item()   # B-ASP or I-ASP
-    opn_toks  = (batch['opinion_labels'][0] > 0).sum().item()  # B-OPN or I-OPN
-    print(f"\n  Real (non-PAD) tokens in sample 0 : {real_toks}")
-    print(f"  Aspect tokens (B/I-ASP)           : {asp_toks}")
-    print(f"  Opinion tokens (B/I-OPN)          : {opn_toks}")
-
-
-# ─────────────────────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    from src.utils import set_seed
-    set_seed(config.SEED)
-
-    # Build loaders
-    train_loader, dev_loader, test_loader = get_dataloaders()
-
-    # Grab and inspect first batch
-    batch = next(iter(train_loader))
-    inspect_batch(batch)
-
-    # Verify all batches load without error
-    print(f"\n[dataloader] Running full train loader pass...")
-    for i, b in enumerate(train_loader):
-        assert b["input_ids"].shape      == (config.BATCH_SIZE, config.MAX_SEQ_LEN) or \
-               b["input_ids"].shape[0]   <= config.BATCH_SIZE, "Shape mismatch!"
-    print(f"[dataloader] All {len(train_loader)} train batches OK.")
-
-    print("\n[dataloader] Step 4 complete!")

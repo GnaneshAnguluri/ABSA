@@ -1,22 +1,17 @@
 """
-preprocess.py - Step 3: Convert raw ASTE samples into BERT-tokenized,
-                BIO-tagged tensors ready for the model.
+preprocess.py - Step 3: Sentence-level ASTE Preprocessing & Candidate Pairing.
 
-The core challenge:
-  Word-level:   [ The,   food,  was,  great ]
-  BERT tokens:  [ [CLS], The,   food, was,   great, [SEP] ]
-  BIO tags:     [ -100,  O,     B-ASP, O,    O,     -100  ]
-
-Multi-word aspects / sub-word tokens:
-  Word:         [ battery,  life ]        <- aspect span [0,1]
-  BERT tokens:  [ bat, ##tery, life ]
-  BIO tags:     [ B-ASP, -100, I-ASP ]   <- only FIRST subword per word gets label
-                                             remaining subwords get -100 (ignored in loss)
+Key changes:
+1. Sentence-level (one sample per review sentence, not duplicated per triplet).
+2. Maintains complete sentence BIO tags for ALL aspects and opinions.
+3. Generates all (Aspect, Opinion) candidate pairs:
+   - Positive pairs (in gold triplets) -> relation = 1 (VALID), sentiment in {0, 1, 2}
+   - Negative pairs (not in gold triplets) -> relation = 0 (INVALID), sentiment = -100 (ignored in loss)
+4. Preserves word-to-subword alignment with word_ids() and -100 masking.
 """
 
 import os
 import sys
-import json
 import torch
 from transformers import AutoTokenizer
 
@@ -24,310 +19,218 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from src.dataset import load_aste_dataset
 
-
-# ─────────────────────────────────────────────────────────────
-#  TAG ID MAPPINGS  (from config)
-# ─────────────────────────────────────────────────────────────
-
-ASPECT_TAG2ID  = config.ASPECT_TAGS    # {"O":0, "B-ASP":1, "I-ASP":2}
-OPINION_TAG2ID = config.OPINION_TAGS   # {"O":0, "B-OPN":1, "I-OPN":2}
-SENTIMENT2ID   = config.SENTIMENT_MAP  # {"NEG":0, "NEU":1, "POS":2}
-
-IGNORE_INDEX   = -100   # PyTorch CrossEntropyLoss ignores this index
+IGNORE_INDEX = -100
 
 
-# ─────────────────────────────────────────────────────────────
-#  CORE BIO CONVERSION — word level -> token level
-# ─────────────────────────────────────────────────────────────
-
-def words_to_bio_tags(words: list, asp_span: list, opn_span: list):
+def build_sentence_bio_tags(words: list, triples: list):
     """
-    Build word-level BIO tag sequences for aspect and opinion.
+    Construct sentence-level BIO tags across all triplets in the sentence.
 
     Args:
-        words    : list of str  e.g. ['The', 'food', 'was', 'great']
-        asp_span : [start, end] inclusive  e.g. [1, 1]
-        opn_span : [start, end] inclusive  e.g. [3, 3]
+        words   : list of word tokens
+        triples : list of {'aspect_span': [s, e], 'opinion_span': [s, e], 'sentiment': str}
 
     Returns:
-        aspect_tags  : list of str  e.g. ['O', 'B-ASP', 'O', 'O']
-        opinion_tags : list of str  e.g. ['O', 'O', 'O', 'B-OPN']
+        word_asp_tags: list of str ('O', 'B-ASP', 'I-ASP')
+        word_opn_tags: list of str ('O', 'B-OPN', 'I-OPN')
+        unique_aspects: list of [start, end]
+        unique_opinions: list of [start, end]
     """
     n = len(words)
-    asp_start, asp_end = asp_span
-    opn_start, opn_end = opn_span
+    word_asp_tags = ["O"] * n
+    word_opn_tags = ["O"] * n
 
-    aspect_tags  = []
-    opinion_tags = []
+    unique_aspects = []
+    unique_opinions = []
 
-    for i in range(n):
-        # ── Aspect BIO ──
-        if i == asp_start:
-            aspect_tags.append("B-ASP")
-        elif asp_start < i <= asp_end:
-            aspect_tags.append("I-ASP")
-        else:
-            aspect_tags.append("O")
+    for t in triples:
+        a_s, a_e = t["aspect_span"]
+        o_s, o_e = t["opinion_span"]
 
-        # ── Opinion BIO ──
-        if i == opn_start:
-            opinion_tags.append("B-OPN")
-        elif opn_start < i <= opn_end:
-            opinion_tags.append("I-OPN")
-        else:
-            opinion_tags.append("O")
+        if [a_s, a_e] not in unique_aspects:
+            unique_aspects.append([a_s, a_e])
+        if [o_s, o_e] not in unique_opinions:
+            unique_opinions.append([o_s, o_e])
 
-    return aspect_tags, opinion_tags
+        # Tag aspect span
+        if 0 <= a_s < n and 0 <= a_e < n:
+            word_asp_tags[a_s] = "B-ASP"
+            for i in range(a_s + 1, a_e + 1):
+                word_asp_tags[i] = "I-ASP"
+
+        # Tag opinion span
+        if 0 <= o_s < n and 0 <= o_e < n:
+            word_opn_tags[o_s] = "B-OPN"
+            for i in range(o_s + 1, o_e + 1):
+                word_opn_tags[i] = "I-OPN"
+
+    return word_asp_tags, word_opn_tags, unique_aspects, unique_opinions
 
 
-def align_tags_to_subwords(words: list, word_tags: list, tokenizer) -> list:
+def encode_sentence_sample(sample: dict, tokenizer, max_len: int = config.MAX_SEQ_LEN) -> dict:
     """
-    Map word-level BIO tags to subword-level token tags.
-
-    Rule:
-      - [CLS], [SEP]         -> IGNORE_INDEX
-      - First subword of word -> word's tag (as ID)
-      - Other subwords        -> IGNORE_INDEX  (not penalised in loss)
-
-    Args:
-        words     : list of str (original words)
-        word_tags : list of str (BIO tags per word)
-        tokenizer : HuggingFace tokenizer
-
-    Returns:
-        token_tag_ids : list of int (one per token including CLS/SEP)
-    """
-    token_tag_ids = [IGNORE_INDEX]   # for [CLS]
-
-    for word, tag in zip(words, word_tags):
-        subwords = tokenizer.tokenize(word)
-        if len(subwords) == 0:
-            continue   # rare edge case (unknown character)
-
-        # First subword -> actual tag
-        if tag in ASPECT_TAG2ID:
-            token_tag_ids.append(ASPECT_TAG2ID[tag])
-        else:
-            token_tag_ids.append(ASPECT_TAG2ID["O"])   # fallback
-
-        # Remaining subwords -> IGNORE
-        for _ in subwords[1:]:
-            token_tag_ids.append(IGNORE_INDEX)
-
-    token_tag_ids.append(IGNORE_INDEX)   # for [SEP]
-    return token_tag_ids
-
-
-# ─────────────────────────────────────────────────────────────
-#  ENCODE A SINGLE SAMPLE
-# ─────────────────────────────────────────────────────────────
-
-def encode_sample(sample: dict, tokenizer, max_len: int = config.MAX_SEQ_LEN) -> list:
-    """
-    Convert ONE raw sample into a list of encoded feature dicts
-    (one dict per triplet in the sample).
-
-    Each feature dict contains:
-        input_ids       : tensor [max_len]       - BERT token IDs
-        attention_mask  : tensor [max_len]       - 1 for real tokens, 0 for padding
-        aspect_labels   : tensor [max_len]       - BIO tag IDs for aspects
-        opinion_labels  : tensor [max_len]       - BIO tag IDs for opinions
-        sentiment_label : int                    - 0/1/2 for NEG/NEU/POS
-        aspect_span     : [start, end]           - word-level span (for pairing module)
-        opinion_span    : [start, end]           - word-level span (for pairing module)
-        sentence        : str                    - original sentence (for debugging)
-
-    Args:
-        sample  : dict with keys 'words', 'triples', 'sentence'
-        tokenizer: HuggingFace tokenizer
-        max_len : maximum token length (pad/truncate to this)
-
-    Returns:
-        List of feature dicts (one per triplet)
+    Encode a single review sentence into ASTE features with pair-level targets.
     """
     words   = sample["words"]
     triples = sample["triples"]
-    features = []
 
-    for triplet in triples:
-        asp_span  = triplet["aspect_span"]   # [start, end]
-        opn_span  = triplet["opinion_span"]  # [start, end]
-        sentiment = triplet["sentiment"]     # 'POS' | 'NEG' | 'NEU'
+    # 1. Build word-level BIO tags and unique spans
+    word_asp_tags, word_opn_tags, unique_aspects, unique_opinions = build_sentence_bio_tags(words, triples)
 
-        # ── 1. Build word-level BIO tags ──
-        word_asp_tags, word_opn_tags = words_to_bio_tags(words, asp_span, opn_span)
+    # 2. Tokenize with BERT WordPiece
+    encoding = tokenizer(
+        words,
+        is_split_into_words=True,
+        max_length=max_len,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt"
+    )
 
-        # ── 2. BERT full encoding (handles CLS, SEP, padding, attention mask) ──
-        encoding = tokenizer(
-            words,
-            is_split_into_words=True,      # words already split
-            max_length=max_len,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt"
-        )
+    input_ids      = encoding["input_ids"].squeeze(0)
+    attention_mask = encoding["attention_mask"].squeeze(0)
+    word_ids       = encoding.word_ids(batch_index=0)
 
-        input_ids      = encoding["input_ids"].squeeze(0)       # [max_len]
-        attention_mask = encoding["attention_mask"].squeeze(0)  # [max_len]
-
-        # ── 3. Align BIO tags to subword tokens ──
-        # We build manually using word_ids() from the encoding
-        word_ids = encoding.word_ids(batch_index=0)
-        # word_ids: list of ints or None (None = CLS, SEP, PAD)
-        #   e.g. [None, 0, 1, 1, 2, 3, None, None, None ...]
-
-        asp_label_ids = []
-        opn_label_ids = []
-        prev_word_id  = None
-
-        for word_id in word_ids:
-            if word_id is None:
-                # CLS, SEP, or PAD token -> ignore
-                asp_label_ids.append(IGNORE_INDEX)
-                opn_label_ids.append(IGNORE_INDEX)
-            elif word_id != prev_word_id:
-                # First subword of this word -> use the actual tag
-                asp_label_ids.append(ASPECT_TAG2ID[word_asp_tags[word_id]])
-                opn_label_ids.append(OPINION_TAG2ID[word_opn_tags[word_id]])
+    # Map word index to subword token span (start_token, end_token)
+    word_to_token_spans = {}
+    for tok_idx, w_id in enumerate(word_ids):
+        if w_id is not None:
+            if w_id not in word_to_token_spans:
+                word_to_token_spans[w_id] = [tok_idx, tok_idx]
             else:
-                # Subsequent subword -> ignore in loss
-                asp_label_ids.append(IGNORE_INDEX)
-                opn_label_ids.append(IGNORE_INDEX)
+                word_to_token_spans[w_id][1] = tok_idx
 
-            prev_word_id = word_id
+    # 3. Align BIO tags to subwords
+    asp_label_ids = []
+    opn_label_ids = []
+    prev_word_id  = None
 
-        # ── 4. Convert to tensors ──
-        asp_labels = torch.tensor(asp_label_ids, dtype=torch.long)  # [max_len]
-        opn_labels = torch.tensor(opn_label_ids, dtype=torch.long)  # [max_len]
-        sent_label = SENTIMENT2ID[sentiment]                          # int
+    for word_id in word_ids:
+        if word_id is None:
+            asp_label_ids.append(IGNORE_INDEX)
+            opn_label_ids.append(IGNORE_INDEX)
+        elif word_id != prev_word_id:
+            # First subword
+            asp_label_ids.append(config.ASPECT_TAGS[word_asp_tags[word_id]])
+            opn_label_ids.append(config.OPINION_TAGS[word_opn_tags[word_id]])
+        else:
+            # Continuation subword
+            asp_label_ids.append(IGNORE_INDEX)
+            opn_label_ids.append(IGNORE_INDEX)
+        prev_word_id = word_id
 
-        features.append({
-            "input_ids"      : input_ids,
-            "attention_mask" : attention_mask,
-            "aspect_labels"  : asp_labels,
-            "opinion_labels" : opn_labels,
-            "sentiment_label": sent_label,
-            "aspect_span"    : asp_span,
-            "opinion_span"   : opn_span,
-            "sentence"       : sample["sentence"],
-        })
+    # 4. Build Candidate Pairs: Cartesian product of all aspects x opinions
+    # Map gold triplets for O(1) lookup
+    gold_triplets_dict = {}
+    for t in triples:
+        key = (tuple(t["aspect_span"]), tuple(t["opinion_span"]))
+        gold_triplets_dict[key] = config.SENTIMENT_MAP[t["sentiment"]]
 
-    return features
+    candidate_pairs = []
+    for asp in unique_aspects:
+        # Check if aspect words are within tokenizer range
+        if asp[0] not in word_to_token_spans or asp[1] not in word_to_token_spans:
+            continue
+        asp_tok_span = [word_to_token_spans[asp[0]][0], word_to_token_spans[asp[1]][1]]
 
+        for opn in unique_opinions:
+            if opn[0] not in word_to_token_spans or opn[1] not in word_to_token_spans:
+                continue
+            opn_tok_span = [word_to_token_spans[opn[0]][0], word_to_token_spans[opn[1]][1]]
 
-# ─────────────────────────────────────────────────────────────
-#  PROCESS FULL SPLIT
-# ─────────────────────────────────────────────────────────────
+            pair_key = (tuple(asp), tuple(opn))
+            if pair_key in gold_triplets_dict:
+                relation_label  = 1   # VALID
+                sentiment_label = gold_triplets_dict[pair_key]
+            else:
+                relation_label  = 0   # INVALID
+                sentiment_label = IGNORE_INDEX  # Ignored in sentiment loss
+
+            candidate_pairs.append({
+                "aspect_word_span" : asp,
+                "opinion_word_span": opn,
+                "aspect_tok_span"  : asp_tok_span,
+                "opinion_tok_span" : opn_tok_span,
+                "relation_label"   : relation_label,
+                "sentiment_label"  : sentiment_label
+            })
+
+    return {
+        "input_ids"      : input_ids,
+        "attention_mask" : attention_mask,
+        "aspect_labels"  : torch.tensor(asp_label_ids, dtype=torch.long),
+        "opinion_labels" : torch.tensor(opn_label_ids, dtype=torch.long),
+        "candidate_pairs": candidate_pairs,
+        "sentence"       : sample["sentence"],
+        "words"          : words,
+        "gold_triples"   : triples
+    }
+
 
 def preprocess_split(data: list, tokenizer, split_name: str = "train") -> list:
-    """
-    Process an entire dataset split (train / dev / test).
-
-    Returns:
-        List of all feature dicts across all samples & triplets.
-    """
-    all_features = []
-    skipped      = 0
+    """Process an entire dataset split at sentence level."""
+    features = []
+    skipped  = 0
+    total_pairs = 0
+    valid_pairs = 0
 
     for sample in data:
         try:
-            feats = encode_sample(sample, tokenizer)
-            all_features.extend(feats)
+            feat = encode_sentence_sample(sample, tokenizer)
+            features.append(feat)
+            for cp in feat["candidate_pairs"]:
+                total_pairs += 1
+                if cp["relation_label"] == 1:
+                    valid_pairs += 1
         except Exception as e:
             skipped += 1
-            print(f"[preprocess] WARNING: skipped sample - {e}")
 
-    print(f"[preprocess] {split_name:5s} -> {len(all_features)} features "
-          f"from {len(data)} sentences  (skipped={skipped})")
-    return all_features
-
-
-# ─────────────────────────────────────────────────────────────
-#  SAVE / LOAD PROCESSED FEATURES
-# ─────────────────────────────────────────────────────────────
-
-def save_features(features: list, path: str):
-    """Save processed features to disk using torch.save."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(features, path)
-    print(f"[preprocess] Saved {len(features)} features -> {path}")
-
-
-def load_features(path: str) -> list:
-    """Load pre-processed features from disk."""
-    features = torch.load(path, weights_only=False)
-    print(f"[preprocess] Loaded {len(features)} features <- {path}")
+    print(f"[preprocess] {split_name:5s} -> {len(features)} sentences (skipped={skipped})")
+    print(f"             Total candidate pairs: {total_pairs} | Valid: {valid_pairs} | Invalid: {total_pairs - valid_pairs}")
     return features
 
 
-# ─────────────────────────────────────────────────────────────
-#  DEBUG — Print a single encoded feature
-# ─────────────────────────────────────────────────────────────
-
-def inspect_feature(feat: dict, tokenizer):
-    """Pretty-print a single encoded feature to verify alignment."""
-    tokens    = tokenizer.convert_ids_to_tokens(feat["input_ids"])
-    asp_ids   = feat["aspect_labels"].tolist()
-    opn_ids   = feat["opinion_labels"].tolist()
-    id2asp    = {v: k for k, v in ASPECT_TAG2ID.items()}
-    id2opn    = {v: k for k, v in OPINION_TAG2ID.items()}
-    id2sent   = config.ID2SENTIMENT
-
-    print(f"\n{'='*80}")
-    print(f" Sentence : {feat['sentence']}")
-    print(f" Sentiment: {id2sent[feat['sentiment_label']]}")
-    print(f" Aspect span  (word-level): {feat['aspect_span']}")
-    print(f" Opinion span (word-level): {feat['opinion_span']}")
-    print(f"\n {'Token':<18} {'Aspect':>8}  {'Opinion':>8}")
-    print(f" {'-'*40}")
-
-    for tok, a, o in zip(tokens, asp_ids, opn_ids):
-        a_str = id2asp.get(a, "IGN") if a != IGNORE_INDEX else "IGN"
-        o_str = id2opn.get(o, "IGN") if o != IGNORE_INDEX else "IGN"
-        marker = " <--" if a_str != "O" and a_str != "IGN" else (
-                 " ***" if o_str != "O" and o_str != "IGN" else "")
-        print(f" {tok:<18} {a_str:>8}  {o_str:>8} {marker}")
-    print(f"{'='*80}")
+def save_features(features: list, path: str):
+    """Save processed features using torch.save."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(features, path)
+    print(f"[preprocess] Saved -> {path}")
 
 
-# ─────────────────────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────────────────────
+def load_features(path: str) -> list:
+    """Load pre-processed features."""
+    return torch.load(path, weights_only=False)
+
 
 if __name__ == "__main__":
-    # ── Load tokenizer ──
-    print(f"\n[preprocess] Loading tokenizer: {config.ENCODER_MODEL}")
+    print(f"[preprocess] Loading tokenizer: {config.ENCODER_MODEL}")
     tokenizer = AutoTokenizer.from_pretrained(config.ENCODER_MODEL)
-    print(f"[preprocess] Vocab size: {tokenizer.vocab_size}")
 
-    # ── Load raw data ──
     train_raw, dev_raw, test_raw = load_aste_dataset(config.DATASET_SPLIT)
 
-    # ── Process each split ──
-    print("\n[preprocess] Processing splits...")
+    print("\n[preprocess] Processing ASTE sentences & generating candidate pairs...")
     train_feats = preprocess_split(train_raw, tokenizer, "train")
     dev_feats   = preprocess_split(dev_raw,   tokenizer, "dev")
     test_feats  = preprocess_split(test_raw,  tokenizer, "test")
 
-    # ── Inspect first 2 features ──
-    print("\n[preprocess] Sample feature inspection:")
-    inspect_feature(train_feats[0], tokenizer)
-    inspect_feature(train_feats[1], tokenizer)
-
-    # ── Save processed features ──
     os.makedirs(config.PROCESSED_DIR, exist_ok=True)
     split = config.DATASET_SPLIT
-    save_features(train_feats, os.path.join(config.PROCESSED_DIR, f"{split}_train.pt"))
-    save_features(dev_feats,   os.path.join(config.PROCESSED_DIR, f"{split}_dev.pt"))
-    save_features(test_feats,  os.path.join(config.PROCESSED_DIR, f"{split}_test.pt"))
+    save_features(train_feats, os.path.join(config.PROCESSED_DIR, f"{split}_train_aste.pt"))
+    save_features(dev_feats,   os.path.join(config.PROCESSED_DIR, f"{split}_dev_aste.pt"))
+    save_features(test_feats,  os.path.join(config.PROCESSED_DIR, f"{split}_test_aste.pt"))
 
-    # ── Tensor shape verification ──
-    f = train_feats[0]
-    print(f"\n[preprocess] Tensor shapes for one feature:")
-    print(f"  input_ids      : {f['input_ids'].shape}")
-    print(f"  attention_mask : {f['attention_mask'].shape}")
-    print(f"  aspect_labels  : {f['aspect_labels'].shape}")
-    print(f"  opinion_labels : {f['opinion_labels'].shape}")
-    print(f"  sentiment_label: {f['sentiment_label']}  (int)")
+    # Inspect first multi-pair sentence
+    for f in train_feats:
+        if len(f["candidate_pairs"]) > 1:
+            print("\n" + "="*70)
+            print("SAMPLE INSPECTION (Sentence with multiple candidate pairs):")
+            print("="*70)
+            print(f"Sentence: {f['sentence']}")
+            print(f"Number of candidate pairs: {len(f['candidate_pairs'])}")
+            for idx, p in enumerate(f["candidate_pairs"]):
+                print(f" Pair {idx}: Aspect={p['aspect_word_span']} | Opinion={p['opinion_word_span']} | "
+                      f"Relation={'VALID (1)' if p['relation_label'] == 1 else 'INVALID (0)'} | "
+                      f"Sentiment={config.ID2SENTIMENT.get(p['sentiment_label'], 'IGNORED (-100)')}")
+            break
 
-    print("\n[preprocess] Step 3 complete!")
+    print("\n[preprocess] ASTE Preprocessing Complete!")

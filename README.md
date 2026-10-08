@@ -1,258 +1,124 @@
-# ABSA Pipeline — Data Pipeline Module
+# Context-Aware End-to-End ABSA / ASTE Pipeline
 ### Branch: `Gnanesh` | Contributor: Gnanesh Anguluri
 
 ---
 
-## What This Branch Contains
+## 1. Project Overview & ASTE Architecture
 
-This branch contains the **complete data pipeline** for an Aspect-Based Sentiment Analysis (ABSA) system — specifically the **Aspect Sentiment Triplet Extraction (ASTE)** task.
+This project implements an **End-to-End Aspect Sentiment Triplet Extraction (ASTE)** pipeline. Unlike traditional sequence classification that assigns a single sentiment to an entire review sentence, ASTE extracts fine-grained, structured sentiment triplets:
+$$\text{(Aspect Term, Opinion Term, Sentiment Polarity)}$$
 
-This is the foundational 1/3 of the full pipeline, responsible for:
-- Acquiring and loading the dataset
-- Converting raw data into model-ready tensors
-- Batching data for training
-
----
-
-## Project Architecture
-
-```
-Input Review Text
-       │
-       ▼
-  dataset.py      ← Download & parse ASTE-Data-V2 from GitHub
-       │
-       ▼
-  preprocess.py   ← BIO tag conversion + BERT subword alignment
-       │
-       ▼
-  dataloader.py   ← Batch tensors into PyTorch DataLoaders
-       │
-       ▼
-   [ Model ]      ← (Steps 5–10, separate branches)
-```
+Example:
+> *"The food was exceptional, but the service was terrible."*  
+> **Output Triplets:**  
+> `[("food", "exceptional", POS), ("service", "terrible", NEG)]`
 
 ---
 
-## Files in This Branch
+## 2. Model Architecture
 
+```text
+                     Input Review Text
+                            │
+                            ▼
+               BERT Encoder (bert-base-uncased) ❄️
+                  [Phase 1: requires_grad=False]
+                            │
+              Contextual Embeddings [SeqLen, 768]
+                            │
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+    Aspect BIO Classifier       Opinion BIO Classifier
+        Linear(768, 3)              Linear(768, 3)
+      [O, B-ASP, I-ASP]           [O, B-OPN, I-OPN]
+              │                           │
+              └─────────────┬─────────────┘
+                            ▼
+                  Candidate Pair Pooling
+                    h_aspect  ∈ R^768
+                    h_opinion ∈ R^768
+                            │
+                            ▼
+               Concatenated Pair Representation
+               [h_aspect ; h_opinion] ∈ R^1536
+                            │
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+   Pair Relation Classifier    Pair Sentiment Classifier
+        Linear(1536, 2)             Linear(1536, 3)
+      [INVALID: 0, VALID: 1]       [NEG: 0, NEU: 1, POS: 2]
 ```
+
+---
+
+## 3. Key Design Choices & Upgrades
+
+### A. Phase 1: Frozen BERT (`requires_grad=False`)
+- The pre-trained `bert-base-uncased` backbone parameters are frozen in Phase 1 (`FREEZE_ENCODER = True`).
+- Only ASTE-specific heads (Aspect Linear, Opinion Linear, Relation Classifier, Sentiment Classifier) are trained.
+- Phase 2 will unfreeze BERT for end-to-end fine-tuning to compare performance.
+
+### B. Candidate Pairing & 1536-Dimensional Pair Representations
+- For each sentence, all detected/gold aspect spans and opinion spans are combined into Cartesian candidate pairs:
+  $$\{(A_1, O_1), (A_1, O_2), (A_2, O_1), (A_2, O_2), \dots\}$$
+- Token representations across each span are mean-pooled into $h_{\text{aspect}} \in \mathbb{R}^{768}$ and $h_{\text{opinion}} \in \mathbb{R}^{768}$.
+- Concatenated vector: $[h_{\text{aspect}}; h_{\text{opinion}}] \in \mathbb{R}^{1536}$.
+
+### C. Binary Pair Relation Classifier
+- A trainable linear classifier maps $1536 \rightarrow 2$:
+  - `VALID (1)`: The pair is a true opinion-aspect association.
+  - `INVALID (0)`: The pair is an incorrect combination.
+
+### D. Pair-Level Sentiment Classifier
+- A trainable linear classifier maps $1536 \rightarrow 3$:
+  - Classes: `NEG (0)`, `NEU (1)`, `POS (2)`.
+  - Pairs marked as `INVALID` have sentiment label `-100` (ignored during sentiment cross-entropy calculation).
+
+### E. Multi-Task Loss Function
+The model optimizes all subtasks jointly:
+$$\mathcal{L}_{\text{total}} = \lambda_{\text{asp}} \mathcal{L}_{\text{asp}} + \lambda_{\text{opn}} \mathcal{L}_{\text{opn}} + \lambda_{\text{rel}} \mathcal{L}_{\text{rel}} + \lambda_{\text{sent}} \mathcal{L}_{\text{sent}}$$
+Initially balanced with equal weights:
+$$\lambda_{\text{asp}} = 1.0, \quad \lambda_{\text{opn}} = 1.0, \quad \lambda_{\text{rel}} = 1.0, \quad \lambda_{\text{sent}} = 1.0$$
+
+### F. Strict ASTE Triplet Evaluation Metric
+Performance is evaluated on **full triplet matching**:
+- A predicted triplet $(A, O, S)$ is correct if and only if:
+  1. Aspect word span matches gold exactly
+  2. Opinion word span matches gold exactly
+  3. Sentiment polarity matches gold exactly
+- Metrics computed: **Precision**, **Recall**, and **F1-Score**.
+
+---
+
+## 4. File Structure
+
+```text
 ABSA/
-├── config.py              ← All hyperparameters & settings
-├── requirements.txt       ← Python dependencies
-├── README.md              ← This file
+├── config.py             # Hyperparameters, tag IDs, FREEZE_ENCODER flag
+├── requirements.txt      # PyTorch, transformers, etc.
+├── README.md             # Project documentation
+│
 └── src/
     ├── __init__.py
-    ├── utils.py           ← Seed & device helpers
-    ├── dataset.py         ← Dataset loading
-    ├── preprocess.py      ← BIO tag conversion
-    └── dataloader.py      ← PyTorch DataLoader
+    ├── utils.py          # Random seed & device utilities
+    ├── dataset.py        # Ingestion & parsing of ASTE-Data-V2
+    ├── preprocess.py     # Sentence-level BIO tagging & candidate pair generation
+    ├── dataloader.py     # PyTorch Dataset & dynamic batch collate_fn
+    ├── model.py          # ASTEModel (Frozen BERT, BIO heads, relation & sentiment heads)
+    ├── evaluate.py       # Strict Triplet Precision, Recall, F1 evaluation
+    └── train.py          # Multi-task training loop & checkpointing
 ```
 
 ---
 
-## Dataset — ASTE-Data-V2 (14res)
+## 5. How to Run
 
-**Source:** [xuuuluuu/SemEval-Triplet-data](https://github.com/xuuuluuu/SemEval-Triplet-data)  
-**Domain:** Restaurant reviews (SemEval 2014)  
-**Task:** Aspect Sentiment Triplet Extraction
-
-Each sample in the dataset is a review sentence annotated with triplets:
-
-```
-Sentence : "The food was great but the service was terrible."
-Triplets : [
-    (food,    great,    POS),   ← aspect + opinion + sentiment
-    (service, terrible, NEG)
-]
-```
-
-### Dataset Statistics (14res split)
-
-| Split | Sentences | Triplets |
-|---|---|---|
-| Train | 1,266 | 2,338 |
-| Dev   | 310   | 577   |
-| Test  | 492   | 994   |
-
-**Sentiment distribution (train):**
-- POS: 72.4%
-- NEG: 20.5%
-- NEU: 7.1%
-
----
-
-## Module Details
-
-### `config.py` — Central Configuration
-
-All hyperparameters defined in one place:
-
-```python
-ENCODER_MODEL = "bert-base-uncased"
-MAX_SEQ_LEN   = 128
-BATCH_SIZE    = 16
-LEARNING_RATE = 2e-5
-EPOCHS        = 20
-
-ASPECT_TAGS   = {"O": 0, "B-ASP": 1, "I-ASP": 2}
-OPINION_TAGS  = {"O": 0, "B-OPN": 1, "I-OPN": 2}
-SENTIMENT_MAP = {"NEG": 0, "NEU": 1, "POS": 2}
-```
-
----
-
-### `src/dataset.py` — Dataset Loading
-
-Downloads the ASTE-Data-V2 `.txt` files directly from GitHub
-(avoids the `pyarrow`/HuggingFace datasets dependency).
-
-**Raw file format:**
-```
-But the staff was so horrible to us .####[([2], [5], 'NEG')]
-```
-- Left of `####` → the sentence
-- Right of `####` → list of triplets as `(aspect_indices, opinion_indices, sentiment)`
-
-**Key functions:**
-- `download_raw_files()` — fetches train/dev/test `.txt` files
-- `parse_file()` — parses each line into structured dicts
-- `load_aste_dataset()` — full pipeline, returns train/dev/test lists
-- `compute_statistics()` — dataset analysis
-- `save_raw_csv()` — saves human-readable CSVs
-
----
-
-### `src/preprocess.py` — BIO Tag Conversion
-
-This is the most critical module. It converts word-level span annotations into subword-level BIO label tensors aligned with BERT's WordPiece tokenizer.
-
-**The BIO Tagging Scheme:**
-```
-O     → this token is not part of an aspect or opinion
-B-ASP → this token BEGINS an aspect term
-I-ASP → this token is INSIDE (continues) an aspect term
-B-OPN → this token BEGINS an opinion term
-I-OPN → this token is INSIDE (continues) an opinion term
-```
-
-**The Subword Alignment Problem:**
-
-BERT splits words into subwords. Labels must be aligned carefully:
-
-```
-Words :  [ The,  battery,  life,   is,  great  ]
-         aspect span = [1, 2]        opinion span = [4, 4]
-
-BERT  :  [CLS], The, bat, ##tery, life, is, great, [SEP], [PAD]...
-word_id: [None,  0,   1,    1,     2,   3,    4,   None,  None]
-
-Aspect:  [ -100,  O, B-ASP, -100, I-ASP, O,   O,   -100,  -100]
-Opinion: [ -100,  O,  O,    -100,   O,   O,  B-OPN, -100, -100]
-```
-
-**Rules applied:**
-- `[CLS]`, `[SEP]`, `[PAD]` → `-100` (ignored in loss)
-- First subword of a word → gets the actual BIO tag
-- Remaining subwords (`##tery`) → `-100` (ignored in loss)
-
-**Why `-100`?** PyTorch's `CrossEntropyLoss` ignores positions labelled `-100` automatically. This means subword tokens never contribute to the loss — only the first subword of each word does.
-
-**Key functions:**
-- `words_to_bio_tags()` — builds word-level BIO sequences from spans
-- `align_tags_to_subwords()` — aligns word tags to BERT subword tokens using `word_ids()`
-- `encode_sample()` — encodes one full sample into tensors
-- `preprocess_split()` — processes all samples in a split
-- `save_features()` / `load_features()` — persist processed tensors
-
-**Output tensor shapes (per feature):**
-```
-input_ids       : [128]   ← BERT token IDs
-attention_mask  : [128]   ← 1=real token, 0=padding
-aspect_labels   : [128]   ← BIO tag IDs for aspects
-opinion_labels  : [128]   ← BIO tag IDs for opinions
-sentiment_label : int     ← 0=NEG, 1=NEU, 2=POS
-```
-
----
-
-### `src/dataloader.py` — PyTorch DataLoader
-
-Wraps processed features into a PyTorch `Dataset` and returns
-`DataLoader` objects for model training.
-
-```python
-train_loader, dev_loader, test_loader = get_dataloaders()
-```
-
-**Batch shape:**
-```
-input_ids       : [16, 128]
-attention_mask  : [16, 128]
-aspect_labels   : [16, 128]
-opinion_labels  : [16, 128]
-sentiment_label : [16]
-```
-
-| Loader | Batches | Shuffle |
-|---|---|---|
-| Train | 147 | ✅ Yes |
-| Dev   | 37  | ❌ No  |
-| Test  | 63  | ❌ No  |
-
-> Train is shuffled to prevent the model memorising example order.
-> Dev/Test are never shuffled so evaluation is reproducible.
-
----
-
-## How to Run
-
-### 1. Install dependencies
-```bash
-pip install torch transformers pandas tqdm scikit-learn matplotlib seaborn tensorboard
-```
-
-### 2. Download & explore dataset
-```bash
-python src/dataset.py
-```
-
-### 3. Preprocess (BIO tagging + tokenization)
+### Step 1: Preprocess Data
 ```bash
 python src/preprocess.py
 ```
 
-### 4. Verify DataLoader
+### Step 2: Run ASTE Multi-Task Training
 ```bash
-python src/dataloader.py
+python src/train.py
 ```
-
----
-
-## Key Design Decisions
-
-| Decision | Reason |
-|---|---|
-| ASTE-Data-V2 over SemEval-2014 alone | ASTE has opinion spans — needed for the opinion extractor head |
-| `bert-base-uncased` | Strong baseline, widely benchmarked, fits on CPU |
-| `MAX_SEQ_LEN = 128` | 99%+ of restaurant reviews fit in 128 tokens |
-| `BATCH_SIZE = 16` | Balances memory usage and gradient stability |
-| Direct GitHub download | Avoids `pyarrow` DLL conflict on Windows |
-| `-100` for subwords | PyTorch CrossEntropy natively ignores this index |
-
----
-
-## Dependencies
-
-```
-torch>=2.0.0
-transformers>=4.35.0
-pandas>=2.0.0
-scikit-learn>=1.3.0
-numpy>=1.24.0
-tqdm>=4.65.0
-```
-
----
-
-*Part of the ABSA minor project — Context-Aware End-to-End Pipeline using BERT/RoBERTa*
